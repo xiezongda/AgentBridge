@@ -1,0 +1,14 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# AgentBridge runtime logs, session IDs, and locks
+runs/
+
+# Temporary live-evaluation copies
+examples/*_eval/
+
+# Local installer script
+install-agy.ps1

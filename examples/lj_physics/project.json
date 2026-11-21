@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "project_id": "lj_physics",
+  "name": "12-6 Lennard–Jones 数值验证",
+  "task_type": "scientific",
+  "goal": "修复简化 12-6 Lennard–Jones 模型，使势能、解析力和 Velocity-Verlet NVE 轨迹符合锁定验收。保留现有 Python API 和单位体系，仅修改授权项目代码。",
+  "project_dir": "project",
+  "verification_dir": "acceptance",
+  "agents": {"require_astra": true},
+  "constraints": {
+    "physical_constraints": ["成对势 U(r)=4ε[(σ/r)^12−(σ/r)^6]", "F_i = −∇_i U，成对力等大反向", "孤立系统采用 Velocity-Verlet 积分"],
+    "units": {"energy": "eV", "length": "Angstrom", "force": "eV/Angstrom", "mass": "amu", "time": "fs"},
+    "assumptions": ["使用氩参数 ε=0.01032 eV、σ=3.405 Angstrom、m=39.948 amu", "三维、无截断、无周期边界、无热浴"],
+    "scope_limitations": ["数值验证覆盖指定的双原子和三原子构型及 600 fs 双原子轨迹。真实凝聚态材料势及宏观热力学需要独立验证。"]
+  },
+  "verifiers": [
+    {"id": "lj_tests", "type": "unittest", "tests_dir": ".", "min_tests": 8},
+    {"id": "measure_lj", "type": "command",
+     "argv": ["{python}", "-I", "-B", "{verification_dir}/verify_lj.py", "{project_dir}", "{artifacts_dir}/metrics.json"],
+     "must_contain": ["Independent LJ metrics written"]},
+    {"id": "metric_schema", "type": "artifact", "path": "metrics.json", "format": "json",
+     "required_keys": ["pair", "forces", "nve"],
+     "exact_fields": {"energy_unit": "eV", "length_unit": "Angstrom", "force_unit": "eV/Angstrom", "mass_unit": "amu", "time_unit": "fs"}},
+    {"id": "physics_thresholds", "type": "numeric_metrics", "path": "metrics.json",
+     "rules": [
+       {"metric": "pair.sigma_energy_error", "op": "le", "threshold": 1e-12, "unit": "eV"},
+       {"metric": "pair.minimum_energy_error", "op": "le", "threshold": 1e-12, "unit": "eV"},
+       {"metric": "forces.minimum_force_norm", "op": "le", "threshold": 1e-10, "unit": "eV/Angstrom"},
+       {"metric": "forces.max_centered_difference_error", "op": "le", "threshold": 1e-8, "unit": "eV/Angstrom"},
+       {"metric": "forces.net_force_norm", "op": "le", "threshold": 1e-12, "unit": "eV/Angstrom"},
+       {"metric": "forces.three_atom_energy_error", "op": "le", "threshold": 1e-12, "unit": "eV"},
+       {"metric": "nve.coarse_dt_fs", "op": "eq", "expected": 4, "unit": "fs"},
+       {"metric": "nve.fine_dt_fs", "op": "eq", "expected": 2, "unit": "fs"},
+       {"metric": "nve.duration_fs", "op": "eq", "expected": 600, "unit": "fs"},
+       {"metric": "nve.coarse_energy_excursion", "op": "le", "threshold": 1e-7, "unit": "eV"},
+       {"metric": "nve.fine_energy_excursion", "op": "le", "threshold": 3e-8, "unit": "eV"},
+       {"metric": "nve.coarse_to_fine_ratio", "op": "between", "min": 3.5, "max": 4.5, "unit": "1"}
+     ]}
+  ],
+  "scientific_claims": [
+    {"claim_id": "pair_and_forces", "statement": "双原子势能特征点、三维力与势能梯度的一致性以及总力为零均满足容差。",
+     "required_verifiers": ["lj_tests", "measure_lj", "metric_schema", "physics_thresholds"],
+     "scope_limitation": "仅覆盖指定双原子和三原子构型的无截断 12-6 LJ 数值模型。"},
+    {"claim_id": "nve_timestep", "statement": "指定 NVE 轨迹的最大能量偏差满足容差，时间步长减半时偏差约降至四分之一。",
+     "required_verifiers": ["lj_tests", "measure_lj", "metric_schema", "physics_thresholds"],
+     "scope_limitation": "仅覆盖该双原子初态、600 fs 积分区间与 4 fs、2 fs 两个时间步长。材料势和宏观热力学性质需独立验证。"}
+  ]
+}

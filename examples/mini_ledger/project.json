@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "project_id": "mini_ledger",
+  "name": "Mini Ledger",
+  "task_type": "engineering",
+  "goal_file": "goal.txt",
+  "project_dir": "project",
+  "verification_dir": "acceptance_tests",
+  "agents": {"require_astra": false},
+  "verifiers": [
+    {"id": "ledger_tests", "type": "unittest", "tests_dir": ".", "min_tests": 8}
+  ]
+}
