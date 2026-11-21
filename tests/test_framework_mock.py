@@ -10,13 +10,14 @@ import sys
 import tempfile
 import unittest
 from collections import deque
+from hashlib import sha256
 from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
 
 from agentbridge import framework
 from agentbridge.bridge import DEFAULT_AGY, DEFAULT_CODEX, WORKDIR
-from agentbridge.iteration_files import IntegrityError, RunFiles
+from agentbridge.iteration_files import IntegrityError, RunFiles, digests, file_sha256, json_text
 from agentbridge.process import ProcessResult, run_process
 from agentbridge.project_spec import ProjectSpec
 from agentbridge.verifiers import VERIFIER_REGISTRY, run_verifiers
@@ -113,10 +114,12 @@ class MockModels:
 
 
 class Fixture(unittest.TestCase):
+    temp_parent = WORKDIR
+
     def setUp(self):
-        temp = tempfile.TemporaryDirectory(dir=WORKDIR, prefix="framework_test_")
+        temp = tempfile.TemporaryDirectory(dir=self.temp_parent, prefix="framework_test_")
         self.addCleanup(temp.cleanup)
-        self.root = Path(temp.name)
+        self.root = Path(temp.name).resolve()
         self.project = self.root / "project"
         self.verification = self.root / "verification"
         self.output = self.root / "runs"
@@ -208,8 +211,8 @@ class ProjectSpecTests(Fixture):
             {"output_dir": "verification/nested"}, {"output_dir": "project/runs"},
             {"schema_version": True}, {"task_type": "other"}, {"verifiers": []},
             {"agents": {"require_astra": True}}, {"goal_file": "goal.txt"},
-            {"limits": {"max_sol_attempts": 4}}, {"limits": {"max_astra_calls": 5}},
-            {"limits": {"max_model_calls": 13}}, {"limits": {"max_plan_revisions": 3}},
+            {"limits": {"max_sol_attempts": 101}}, {"limits": {"max_astra_calls": 101}},
+            {"limits": {"max_model_calls": 501}}, {"limits": {"max_plan_revisions": 51}},
             {"limits": {"timeout_s": False}},
         ):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
@@ -518,7 +521,8 @@ class FrameworkTests(Fixture):
         self.assertEqual(state["resume_state"], "ROUND_SOL_EXEC")
         run_dir = state["run_dir"]
         contract = state["locked_contract_hash"]
-        state = framework.resume(run_dir, pause_after="sol_exec", runner=mock, max_model_calls=7)
+        state = framework.resume(run_dir, pause_after="sol_exec", runner=mock, max_model_calls=7,
+                                 budget_reason="Trim the remaining model budget.")
         self.assertEqual(state["current_state"], "PAUSED", state["stop_reason"])
         self.assertEqual(state["resume_state"], "ROUND_VERIFY")
         self.assertEqual(mock.roles(), ["neon", "astra", "sol"])
@@ -587,12 +591,13 @@ class FrameworkTests(Fixture):
             return plan()
 
         mock = MockModels(self, neon_replies=[mark, neon()], sol_replies=[self.fix])
-        state = self.run_models(mock, limits={"max_model_calls": 1})
+        state = self.run_models(mock, limits={"max_model_calls": 1, "max_sol_attempts": 1})
         self.assertEqual(state["current_state"], "PAUSED")
         state = framework.resume(state["run_dir"], runner=mock)
         self.assertEqual(state["current_state"], "STOPPED_BUDGET_EXCEEDED")
         self.assertEqual(mock.roles(), ["neon"])
-        state = framework.resume(state["run_dir"], runner=mock, max_model_calls=3)
+        state = framework.resume(state["run_dir"], runner=mock, max_model_calls=3,
+                                 budget_reason="Allow implementation and review.")
         self.assertEqual(state["current_state"], "COMPLETED_PASS", state["stop_reason"])
 
     def test_astra_budget_blocks_acceptance_until_budget_is_raised(self):
@@ -603,17 +608,26 @@ class FrameworkTests(Fixture):
         self.assertEqual(state["resume_state"], "ASTRA_SCIENTIFIC_ACCEPT")
         self.assertTrue(state["verification"]["all_passed"])
         self.assertEqual(mock.roles(), ["neon", "astra", "sol", "neon"])
-        state = framework.resume(state["run_dir"], runner=mock, max_astra_calls=2)
+        state = framework.resume(state["run_dir"], runner=mock, max_astra_calls=2,
+                                 budget_reason="Allow the scientific acceptance call.")
         self.assertEqual(state["current_state"], "COMPLETED_PASS", state["stop_reason"])
         self.assertEqual(mock.roles(), ["neon", "astra", "sol", "neon", "astra"])
 
     def test_plan_revision_cap_keeps_contract_unlocked_and_blocks_sol(self):
-        mock = MockModels(self, neon_replies=[plan()], astra_replies=[astra("REVISE")])
-        state = self.run_models(mock, science=True, limits={"max_plan_revisions": 0})
-        self.assertEqual(state["current_state"], "STOPPED_NEED_HUMAN")
+        mock = MockModels(self, neon_replies=[plan(), plan(), plan(), neon()],
+                          astra_replies=[astra("REVISE"), astra("REVISE"), astra(), verdict()],
+                          sol_replies=[self.fix])
+        state = self.run_models(mock, science=True, limits={"max_plan_revisions": 1})
+        self.assertEqual(state["current_state"], "STOPPED_BUDGET_EXCEEDED")
         self.assertIn("revision limit", state["stop_reason"])
         self.assertIsNone(state["locked_contract_hash"])
-        self.assertEqual(mock.roles(), ["neon", "astra"])
+        self.assertEqual(mock.roles(), ["neon", "astra", "neon", "astra"])
+        previous = state["completed_steps"]
+        state = framework.resume(state["run_dir"], runner=mock, max_plan_revisions=2,
+                                 budget_reason="Review a second plan revision.")
+        self.assertEqual(state["current_state"], "COMPLETED_PASS", state["stop_reason"])
+        self.assertEqual(state["completed_steps"][:len(previous)], previous)
+        self.assertEqual(mock.roles(), ["neon", "astra", "neon", "astra", "neon", "astra", "sol", "neon", "astra"])
 
     def test_total_wall_clock_budget_caps_subprocess_and_stops_model_calls(self):
         now = 0.0
@@ -655,6 +669,406 @@ class FrameworkTests(Fixture):
         self.assertEqual(invoke("status", "--run-dir", run)[1]["current_state"], "PAUSED")
         self.assertEqual(invoke("resume", "--run-dir", run)[0], 0)
         self.assertEqual(invoke("validate")[0], 1)
+
+
+class ExternalProjectTests(Fixture):
+    temp_parent = None
+
+    def setUp(self):
+        super().setUp()
+        self.assertFalse(self.root.is_relative_to(WORKDIR))
+        self.inputs = self.root / "inputs"
+        self.inputs.mkdir()
+        self.samples = self.inputs / "samples"
+        self.samples.mkdir()
+        (self.samples / "dataset.bin").write_bytes(b"dataset sample")
+        (self.samples / "cache.tmp").write_text("scratch", encoding="utf-8")
+        self.critical = self.inputs / "critical.tmp"
+        self.critical.write_text("immutable sample", encoding="utf-8")
+        self.goal = self.inputs / "goal.txt"
+        self.goal.write_text("External goal", encoding="utf-8")
+        self.config_path = self.root / "contracts" / "project.json"
+        self.config_path.parent.mkdir()
+
+    def config(self, **overrides):
+        data = super().config(**{"allow_external_paths": True, "project_dir": "../project",
+                                  "verification_dir": str(self.verification), "output_dir": "../runs",
+                                  "readonly_inputs": [str(self.critical), "../inputs/samples"], **overrides})
+        if "goal" not in overrides:
+            del data["goal"]
+            data.setdefault("goal_file", "../inputs/goal.txt")
+        return data
+
+    def test_external_validation_start_resume_and_status(self):
+        mock = MockModels(self, neon_replies=[plan(), neon()], sol_replies=[self.fix])
+        state = self.run_models(mock, pause_after="baseline_verify")
+        self.assertEqual(state["current_state"], "PAUSED", state["stop_reason"])
+        run = state["run_dir"]
+        self.assertEqual(Path(run).parent, self.output)
+        self.assertEqual(framework.status(run)["goal"], "External goal")
+        self.assertFalse(framework.pause(run)["pause_requested"])
+        state = framework.resume(run, runner=mock)
+        self.assertEqual(state["current_state"], "COMPLETED_PASS", state["stop_reason"])
+        self.assertEqual(state["config"]["readonly_inputs"], [str(self.critical), str(self.samples)])
+        self.assertEqual(state["readonly_manifest"][str(self.samples)]["cache.tmp"]["integrity_mode"], "ignored")
+        new_config = self.config_path.with_name("project-v2.json")
+        new_config.write_text(json.dumps(self.config(goal="Revised external goal")), encoding="utf-8")
+        child = framework.revise(run, new_config, reason="Check a revised external goal",
+                                 pause_after="baseline_verify", runner=local_only)
+        self.assertEqual(child["parent_run_id"], state["run_id"])
+        self.assertEqual(Path(child["run_dir"]).parent, self.output)
+        self.assertEqual(child["current_state"], "PAUSED")
+
+    def test_external_opt_in_blacklist_overlap_and_checkpoint_binding(self):
+        for overrides in (
+            {"allow_external_paths": False}, {"allow_external_paths": 1},
+            {"project_dir": self.project.anchor}, {"project_dir": str(Path.home())},
+            {"project_dir": str(WORKDIR / "agentbridge")}, {"project_dir": str(WORKDIR / "runs")},
+            {"output_dir": str(self.output / ".git" / "logs")},
+            {"output_dir": str(Path(self.project.anchor) / "Windows" / "logs")},
+            {"output_dir": str(Path(self.project.anchor) / "Program Files" / "logs")},
+            {"goal_file": "../.ssh/id_rsa"}, {"readonly_inputs": ["../project/answer.txt"]},
+            {"readonly_inputs": ["../runs"]}, {"verification_dir": "../project"},
+        ):
+            with self.subTest(overrides=overrides), self.assertRaises(ValueError):
+                self.spec(**overrides)
+        state = self.run_models(MockModels(self), pause_after="baseline_verify")
+        files = RunFiles(Path(state["run_dir"]), allow_external=True)
+        state["output_dir"] = str(self.project)
+        files.write("state.json", json.dumps(state))
+        with self.assertRaisesRegex(IntegrityError, "does not match"):
+            framework.status(files.directory)
+        unrecognized = self.output / uuid4().hex
+        unrecognized.mkdir()
+        with self.assertRaises(OSError):
+            framework.resume(unrecognized, runner=local_only)
+        self.assertFalse((unrecognized / "run.lock").exists())
+
+    def test_sol_cannot_change_explicit_readonly_file_even_if_glob_matches(self):
+        def tamper(_cwd):
+            self.critical.write_text("changed sample", encoding="utf-8")
+            self.set_answer(42)
+            return "changed input"
+
+        mock = MockModels(self, neon_replies=[plan()], sol_replies=[tamper])
+        state = self.run_models(mock, file_policy={"ignore_globs": ["*.tmp"], "max_full_hash_bytes": 8})
+        self.assertEqual(state["current_state"], "STOPPED_PERMISSION_OR_TAMPER")
+        self.assertIn("readonly input", state["stop_reason"])
+        self.assertEqual(state["readonly_manifest"][str(self.critical)]["critical.tmp"]["integrity_mode"],
+                         "content_and_hash")
+        self.assertEqual(mock.roles(), ["neon", "sol"])
+
+    def test_hardlink_is_rejected_even_under_ignored_directory(self):
+        folder = self.project / "node_modules"
+        folder.mkdir()
+        os.link(self.critical, folder / "linked.tmp")
+        spec = self.spec(readonly_inputs=[])
+        with self.assertRaisesRegex(IntegrityError, "unlinked"):
+            spec.snapshot_project()
+
+
+class FilePolicyTests(Fixture):
+    def test_mixed_project_changes_record_integrity_modes_and_diff(self):
+        files = {"sample.bin": b"\0" * 500, "dataset.bin": b"x" * 2200,
+                 "forced.bin": b"y" * 2300, "cache.tmp": b"ignored"}
+        for name, value in files.items():
+            (self.project / name).write_bytes(value)
+
+        def update(cwd):
+            for name, value in files.items():
+                (cwd / name).write_bytes(value + b"!")
+            return self.fix(cwd)
+
+        mock = MockModels(self, neon_replies=[plan()], sol_replies=[update])
+        state = self.run_models(mock, pause_after="sol_exec", file_policy={
+            "max_text_diff_bytes": 32, "max_full_hash_bytes": 2048, "stream_hash_globs": ["forced.bin"]})
+        self.assertEqual(state["current_state"], "PAUSED", state["stop_reason"])
+        manifest = state["project_manifest"]
+        self.assertEqual(manifest["answer.txt"]["integrity_mode"], "content_and_hash")
+        self.assertEqual(manifest["cache.tmp"]["integrity_mode"], "ignored")
+        for name in ("sample.bin", "forced.bin"):
+            self.assertEqual(manifest[name]["integrity_mode"], "stream_hash_only")
+            self.assertEqual(manifest[name]["sha256"], file_sha256(self.project / name))
+        self.assertEqual(manifest["dataset.bin"]["integrity_mode"], "metadata_only")
+        self.assertNotIn("sha256", manifest["dataset.bin"])
+        self.assertIn("mtime_ns", manifest["dataset.bin"])
+        execution = state["rounds"]["1"]["executions"][0]
+        self.assertNotIn("cache.tmp", execution["changes"]["modified"])
+        diff = (Path(state["run_dir"]) / execution["patch_file"]).read_text(encoding="utf-8")
+        self.assertIn("--- a/answer.txt", diff)
+        self.assertIn("+42", diff)
+        self.assertIn("未做内容完整性校验", diff)
+        self.assertIn("stream_hash_only: SHA-256 / size changed", diff)
+
+    def test_patch_bound_marks_utf8_diff_truncated(self):
+        def update(cwd):
+            (cwd / "answer.txt").write_text("试" * 2000, encoding="utf-8")
+            return "large edit"
+
+        state = self.run_models(MockModels(self, neon_replies=[plan()], sol_replies=[update]),
+                                pause_after="sol_exec", file_policy={"max_patch_bytes": 128})
+        execution = state["rounds"]["1"]["executions"][0]
+        patch_file = Path(state["run_dir"]) / execution["patch_file"]
+        self.assertTrue(execution["patch_truncated"])
+        self.assertLessEqual(patch_file.stat().st_size, 128)
+        self.assertIn("patch truncated", patch_file.read_text(encoding="utf-8"))
+        self.assertFalse((patch_file.parent / ".sol-before").exists())
+
+    def test_verification_file_and_config_always_hash_even_when_glob_matches(self):
+        check = self.verification / "fixed.tmp"
+        check.write_text("old", encoding="utf-8")
+        mock = MockModels(self)
+        state = self.run_models(mock, pause_after="baseline_verify", file_policy={"ignore_globs": ["*"]})
+        entry = state["verification_manifest"]["fixed.tmp"]
+        self.assertEqual(entry["integrity_mode"], "stream_hash_only")
+        check.write_text("new", encoding="utf-8")
+        os.utime(check, ns=(entry["mtime_ns"], entry["mtime_ns"]))
+        state = framework.resume(state["run_dir"], runner=mock)
+        self.assertEqual(state["current_state"], "STOPPED_PERMISSION_OR_TAMPER")
+        self.assertIn("SHA-256", state["stop_reason"])
+
+    def test_disk_capture_bounds_audits_and_parses_untruncated_protocol(self):
+        measure = self.verification / "measure.py"
+        with measure.open("a", encoding="utf-8") as stream:
+            stream.write("print('x' * 80000, 'REQUIRED-MIDDLE', 'y' * 80000)\n"
+                         "print('z' * 140000, file=sys.stderr)\n")
+        data = self.config(file_policy={"max_audit_stream_bytes": 120, "max_context_chars": 1200})
+        data["verifiers"][0]["must_contain"].append("REQUIRED-MIDDLE")
+        spec = self.spec(data)
+
+        def local_neon(_path, _timeout, _prompt, conversation):
+            reply = neon() if conversation else plan()
+            # Build large noise at runtime to keep the command line short.
+            script = "import sys; print('x'*85000); print(sys.argv[1]); print('y'*85000)"
+            return [sys.executable, "-I", "-c", script, json.dumps({
+                "status": "success", "conversation_id": "local-neon", "response": reply})]
+
+        def local_sol(*_):
+            script = ("import json; from pathlib import Path; "
+                      "Path('answer.txt').write_text('42'); "
+                      "print(json.dumps({'type':'thread.started','thread_id':'local-sol'})); "
+                      "[print(json.dumps({'type':'noise','text':'x'*1024})) for _ in range(170)]; "
+                      "print(json.dumps({'type':'item.completed','item':"
+                      "{'type':'agent_message','text':'actual result'}})); "
+                      "print(json.dumps({'type':'turn.completed'}))")
+            return [sys.executable, "-I", "-c", script]
+
+        with (patch("agentbridge.framework.neon_command", side_effect=local_neon),
+              patch("agentbridge.framework.sol_command", side_effect=local_sol),
+              patch("agentbridge.process.MAX_PROTOCOL_RECORD_BYTES", 4096)):
+            state = framework.start(spec)
+        self.assertEqual(state["current_state"], "COMPLETED_PASS", state["stop_reason"])
+        self.assertEqual(state["sol_thread_id"], "local-sol")
+        run = Path(state["run_dir"])
+        for path in [*run.glob("model_*.json"), run / "baseline_verify.json", run / "round_1_verify.json"]:
+            report = json.loads(path.read_text(encoding="utf-8"))
+            streams = report if path.name.startswith("model_") else report["results"][0]
+            for channel in ("stdout", "stderr"):
+                output = streams[channel]
+                if channel == "stderr" and path.name.startswith("model_"):
+                    self.assertEqual(output, "")
+                else:
+                    self.assertTrue(output["truncated"])
+                    self.assertGreater(output["original_bytes"], 100000)
+                    self.assertLessEqual(len(output["excerpt"].encode("utf-8")), 120)
+        self.assertEqual(state["baseline"]["audit_file"], "baseline_verify.json")
+        for result in state["verification"]["results"]:
+            self.assertNotIn("stdout", result)
+            self.assertNotIn("stderr", result)
+
+    def test_sealed_artifact_is_not_rehashed_at_later_checkpoints(self):
+        with (self.verification / "measure.py").open("a", encoding="utf-8") as stream:
+            stream.write("Path('history.bin').write_bytes(b'x' * 70000)\n")
+        mock = MockModels(self, neon_replies=[plan(), neon()], sol_replies=[self.fix])
+        state = self.run_models(mock, pause_after="baseline_verify")
+        historical = Path(state["baseline"]["artifacts_dir"]) / "history.bin"
+        key = "artifacts/baseline_verify/history.bin"
+        self.assertEqual(state["audit_index"][key]["sha256"], file_sha256(historical))
+        with patch("agentbridge.iteration_files.file_sha256", wraps=file_sha256) as hashed:
+            state = framework.resume(state["run_dir"], runner=mock)
+        self.assertEqual(state["current_state"], "COMPLETED_PASS", state["stop_reason"])
+        self.assertNotIn(historical, [args[0] for args, _ in hashed.call_args_list])
+
+
+class HumanResumeTests(Fixture):
+    def test_legacy_paused_checkpoint_upgrades_with_original_contract_hash(self):
+        mock = MockModels(self, neon_replies=[plan(), neon()], sol_replies=[self.fix])
+        state = self.run_models(mock, pause_after="baseline_verify")
+        files = RunFiles(Path(state["run_dir"]))
+        config = state["config"]
+        for key in ("allow_external_paths", "readonly_inputs", "file_policy"):
+            del config[key]
+        state["verification_manifest"] = digests(state["verification_manifest"])
+        state["project_manifest"] = digests(state["project_manifest"])
+        del state["audit_index"]
+        old_contract = {**config, "limits": {key: config["limits"][key] for key in
+                                           ("timeout_s", "max_plan_revisions")}}
+        old_hash = sha256(json_text({"spec": old_contract, "verification_manifest": state["verification_manifest"]})
+                          .encode("utf-8")).hexdigest()
+        state["contract_hash"] = old_hash
+        files.write("state.json", json_text(state))
+        final = framework.resume(files.directory, runner=mock)
+        self.assertEqual(final["current_state"], "COMPLETED_PASS", final["stop_reason"])
+        self.assertEqual(final["locked_contract_hash"], old_hash)
+        self.assertEqual(final["completed_steps"].count("baseline_verify"), 1)
+
+    def test_neon_human_stop_resumes_same_plan_session_without_replay(self):
+        mock = MockModels(self, neon_replies=[neon("NEED_HUMAN"), plan(), neon()], sol_replies=[self.fix])
+        original = self.run_models(mock)
+        self.assertEqual(original["current_state"], "STOPPED_NEED_HUMAN")
+        decision = self.root / "decision.json"
+        decision.write_text(json.dumps({"note": "Use the original measurement", "reason": "Confirmed scope"}),
+                            encoding="utf-8")
+        run = original["run_dir"]
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(main(["resume", "--run-dir", run, "--decision-file", str(decision)], runner=mock), 0)
+        final = framework.status(run, full=True)
+        self.assertEqual(final["completed_steps"][:len(original["completed_steps"])], original["completed_steps"])
+        self.assertEqual(final["neon_conversation_id"], original["neon_conversation_id"])
+        self.assertIn("--conversation", mock.calls[1][1])
+        self.assertIn("Use the original measurement", mock.prompts("neon")[1])
+        self.assertEqual(final["human_decisions"][0]["reason"], "Confirmed scope")
+
+    def test_scientific_guidance_keeps_sessions_and_old_evidence(self):
+        mock = MockModels(self, neon_replies=[plan(), neon(), neon()], sol_replies=[self.fix],
+                          astra_replies=[astra(), verdict("INSUFFICIENT_EVIDENCE", "INSUFFICIENT_EVIDENCE"),
+                                         verdict()])
+        original = self.run_models(mock, science=True)
+        run = original["run_dir"]
+        final = framework.resume(run, runner=mock, human_note="Use the locked measurement and scope.")
+        self.assertEqual(final["current_state"], "COMPLETED_PASS", final["stop_reason"])
+        self.assertEqual(final["completed_steps"][:len(original["completed_steps"])], original["completed_steps"])
+        for key in ("neon_conversation_id", "sol_thread_id", "astra_thread_id"):
+            self.assertEqual(final[key], original[key])
+        self.assertIn("Use the locked measurement", mock.prompts("neon")[-1])
+        self.assertEqual(mock.roles().count("sol"), 1)
+
+    def test_retry_pending_sol_is_explicit_and_counts_new_attempt(self):
+        def interrupted(_cwd):
+            self.set_answer(17)
+            raise KeyboardInterrupt
+
+        mock = MockModels(self, neon_replies=[plan(), neon()], sol_replies=[interrupted, self.fix])
+        state = self.run_models(mock)
+        run = state["run_dir"]
+        status = framework.status(run)
+        self.assertEqual(status["active_role"], "human")
+        self.assertTrue(any("project" in text for text in status["pending_check_items"]))
+        self.assertEqual(len(status["next_step"]["commands"]), 2)
+        final = framework.resume(run, runner=mock, resolve_pending="retry", human_note="Complete the edit")
+        self.assertEqual(final["current_state"], "COMPLETED_PASS", final["stop_reason"])
+        self.assertEqual(final["sol_attempts"], 2)
+        self.assertTrue(final["rounds"]["1"]["executions"][0]["interrupted"])
+        self.assertIn("Complete the edit", mock.prompts("sol")[-1])
+        self.assertEqual(final["human_decisions"][0]["action"], "retry")
+
+    def test_reverify_pending_sol_uses_patch_and_cannot_skip_failing_acceptance(self):
+        def interrupted(_cwd):
+            self.set_answer(17)
+            raise KeyboardInterrupt
+
+        mock = MockModels(self, neon_replies=[plan(), neon()], sol_replies=[interrupted])
+        state = self.run_models(mock)
+        run = state["run_dir"]
+        final = framework.resume(run, resolve_pending="reverify", human_reason="Changes are on disk", runner=mock)
+        self.assertEqual(final["current_state"], "STOPPED_NEED_HUMAN", final["stop_reason"])
+        self.assertFalse(final["verification"]["all_passed"])
+        self.assertEqual(mock.roles(), ["neon", "sol", "neon"])
+        diff = Path(framework.status(run)["logs"]["latest_diff"])
+        self.assertIn("+17", diff.read_text(encoding="utf-8"))
+        self.assertEqual(final["completed_steps"].count("round_1_sol_exec"), 1)
+        self.assertEqual(final["human_decisions"][-1]["affected_steps"], ["round_1_sol_exec", "ROUND_VERIFY"])
+
+    def test_retry_interrupted_verifier_preserves_partial_artifacts(self):
+        def interrupted(argv, *, cwd, **_):
+            self.assertEqual(argv[0], sys.executable)
+            (cwd / "partial.txt").write_text("partial", encoding="utf-8")
+            raise KeyboardInterrupt
+
+        state = framework.start(self.spec(), runner=interrupted)
+        self.assertEqual(state["pending_step"]["step"], "baseline_verify")
+        with self.assertRaisesRegex(ValueError, "only for interrupted Sol"):
+            framework.resume(state["run_dir"], runner=local_only, resolve_pending="reverify")
+        final = framework.resume(state["run_dir"], runner=local_only, resolve_pending="retry",
+                                 pause_after="baseline_verify")
+        self.assertEqual(final["current_state"], "PAUSED", final["stop_reason"])
+        partial = Path(final["human_decisions"][0]["interrupted_evidence"]["artifacts_dir"])
+        self.assertEqual((partial / "partial.txt").read_text(encoding="utf-8"), "partial")
+        self.assertNotEqual(str(partial), final["baseline"]["artifacts_dir"])
+        self.assertIn("baseline_verify", final["completed_steps"])
+
+    def test_revise_creates_child_runs_baseline_and_astra_and_preserves_old_failure(self):
+        mock = MockModels(self, neon_replies=[plan(), neon()], sol_replies=["no change"])
+        old = self.run_models(mock)
+        old_dir = Path(old["run_dir"])
+        old_bytes = {file.name: file.read_bytes() for file in old_dir.iterdir() if file.is_file()}
+        config = self.config(science=True, goal="Test the revised scientific hypothesis")
+        config["verifiers"][1]["rules"][0]["expected"] = 0
+        revised = self.root / "new_project.json"
+        revised.write_text(json.dumps(config), encoding="utf-8")
+        new_models = MockModels(self, neon_replies=[plan()], astra_replies=[astra()])
+        with contextlib.redirect_stdout(io.StringIO()) as stdout:
+            code = main(["revise", "--run-dir", str(old_dir), "--config", str(revised), "--reason",
+                         "Change the comparison hypothesis", "--pause-after", "astra_contract"], runner=new_models)
+        self.assertEqual(code, 2, stdout.getvalue())
+        new = framework.status(json.loads(stdout.getvalue())["run_dir"], full=True)
+        self.assertEqual(new["contract_version"], 2)
+        self.assertEqual(new["parent_run_id"], old["run_id"])
+        self.assertEqual(new["parent_contract_hash"], old["contract_hash"])
+        self.assertFalse(new["inherited_evidence"]["verification"]["all_passed"])
+        self.assertTrue(new["baseline"]["all_passed"])
+        self.assertIn("goal", new["contract_diff"])
+        self.assertIn("verifiers", new["contract_diff"])
+        self.assertIn("ASTRA_CONTRACT_REVIEW", new["affected_steps"])
+        self.assertEqual(new_models.roles(), ["neon", "astra"])
+        self.assertEqual(new["locked_contract_hash"], new["contract_hash"])
+        for name, content in old_bytes.items():
+            self.assertEqual((old_dir / name).read_bytes(), content)
+
+    def test_project_budgets_and_model_cannot_adjust_them(self):
+        large = {"max_sol_attempts": 10, "max_model_calls": 30, "max_astra_calls": 12, "max_plan_revisions": 8,
+                 "max_consecutive_failures": 7, "timeout_s": 480, "max_total_seconds": 4000}
+        self.assertEqual(self.spec(limits=large).limits, large)
+        for key, value in (("max_sol_attempts", 0), ("max_plan_revisions", True), ("timeout_s", float("inf")),
+                           ("max_total_seconds", -1), ("max_model_calls", 1)):
+            with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                ProjectSpec.validate_limits({key: value})
+        mock = MockModels(self, neon_replies=[{**plan(), "limits": large}, neon()], sol_replies=[self.fix])
+        old = self.run_models(mock, limits={"max_model_calls": 1, "max_sol_attempts": 1})
+        self.assertEqual(old["current_state"], "STOPPED_BUDGET_EXCEEDED")
+        self.assertEqual(old["config"]["limits"]["max_model_calls"], 1)
+        self.assertEqual(old["budget_history"], [])
+        with self.assertRaisesRegex(ValueError, "budget-reason"):
+            framework.resume(old["run_dir"], runner=mock, max_model_calls=3)
+        final = framework.resume(old["run_dir"], runner=mock, max_model_calls=3, budget_reason="Finish review")
+        self.assertEqual(final["current_state"], "COMPLETED_PASS", final["stop_reason"])
+        history = final["budget_history"][0]
+        self.assertEqual((history["before"]["max_model_calls"], history["after"]["max_model_calls"]), (1, 3))
+        self.assertEqual(history["reason"], "Finish review")
+        events = [json.loads(line) for line in (Path(final["run_dir"]) / "events.jsonl").read_text(
+            encoding="utf-8").splitlines()]
+        self.assertEqual(next(event for event in events if event["event"] == "budget_adjusted")["timestamp"],
+                         history["timestamp"])
+
+    def test_status_cli_summary_and_full(self):
+        mock = MockModels(self, neon_replies=[plan(), neon()], sol_replies=["no change"])
+        state = self.run_models(mock)
+        args = ["status", "--run-dir", state["run_dir"]]
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(main(args, runner=mock), 0)
+        summary = json.loads(output.getvalue())
+        self.assertTrue({"project_id", "goal", "contract_version", "parent_run_id", "active_role",
+                         "latest_result", "next_step", "budgets", "sessions", "logs",
+                         "human_decisions", "budget_history"}.issubset(summary))
+        self.assertNotIn("pending_check_items", summary)
+        self.assertEqual(summary["active_role"], "human")
+        self.assertTrue(summary["latest_result"]["model"]["overridden"])
+        self.assertFalse(summary["latest_result"]["verification"]["all_passed"])
+        self.assertTrue(Path(summary["logs"]["latest_verification"]).is_file())
+        self.assertTrue(Path(summary["logs"]["latest_model_audit"]).is_file())
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(main([*args, "--full"], runner=mock), 0)
+        self.assertEqual(json.loads(output.getvalue()), state)
 
 
 class LennardJonesExampleTests(Fixture):

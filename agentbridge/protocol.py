@@ -2,6 +2,7 @@
 
 import json
 import math
+import mmap
 import re
 
 
@@ -31,6 +32,9 @@ _STRICT_JSON = json.JSONDecoder(
 # The first decoder identifies object boundaries even when a value or key is invalid.
 _JSON_BOUNDARIES = json.JSONDecoder()
 _JSON_START = re.compile(r"[\[{]")
+_BYTE_START = re.compile(rb"[\[{]")
+_BYTE_TOKENS = re.compile(rb'\\.|["{}\[\]]', re.DOTALL)
+_BYTE_DECLARED = re.compile(rb'\{\s*"')
 
 
 def _load_json(text: str) -> object:
@@ -71,6 +75,60 @@ def parse_agy_json(stdout: str) -> dict:
     return extract_json_object(stdout)
 
 
+def parse_agy_stream(stream, record_limit):
+    """Search disk-backed stdout for a complete JSON envelope, without copying log noise."""
+    size = stream.seek(0, 2)
+    stream.seek(0)
+    if size <= record_limit:
+        return parse_agy_json(stream.read(record_limit).decode("utf-8"))
+    with mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) as data:
+        first = re.search(rb"\S", data)
+        position, found = 0, None
+        while opening := _BYTE_START.search(data, position):
+            start = opening.start()
+            boundary = min(size, start + record_limit)
+            end = _frame_end(data, start, boundary)
+            if end is None and boundary < size:
+                raise ValueError(f"Neon protocol record exceeds {record_limit} bytes")
+            try:
+                if not end:
+                    raise ValueError("incomplete JSON frame")
+                frame = data[start:end].decode("utf-8")
+                value, _ = _JSON_BOUNDARIES.raw_decode(frame)
+            except ValueError:
+                if opening[0] == b"{" and (start == first.start() or _BYTE_DECLARED.match(data, start, boundary)):
+                    raise ValueError("malformed JSON object or array") from None
+                position = start + 1
+                continue
+            position = end
+            if isinstance(value, dict):
+                if found is not None:
+                    raise ValueError("multiple JSON objects found")
+                found = _load_json(frame)
+        if found is None:
+            raise ValueError("no JSON object found")
+        return found
+
+
+def _frame_end(data, start, boundary):
+    stack = []
+    quoted = False
+    for match in _BYTE_TOKENS.finditer(data, start, boundary):
+        token = match[0]
+        if token == b'"':
+            quoted = not quoted
+        elif not quoted and token in (b"{", b"["):
+            stack.append(b"}" if token == b"{" else b"]")
+            if len(stack) > 1000:
+                raise ValueError("Neon protocol record is nested too deeply")
+        elif not quoted and token in (b"}", b"]"):
+            if not stack or stack.pop() != token:
+                return 0
+            if not stack:
+                return match.end()
+    return None
+
+
 def parse_model_object(response: object) -> dict:
     if isinstance(response, dict):
         return response
@@ -79,14 +137,17 @@ def parse_model_object(response: object) -> dict:
     raise ValueError("expected a JSON object in the response")
 
 
-def parse_codex_jsonl(stdout: str) -> dict:
-    thread_ids = []
+def parse_codex_jsonl(stdout) -> dict:
+    thread_id = None
+    thread_events = 0
     message = None
     completed_turns = 0
     usage = None
     errors = []
     failure_events = []
-    for line_number, line in enumerate(stdout.split("\n"), 1):
+    legacy = isinstance(stdout, str)
+    lines = stdout.split("\n") if legacy else stdout
+    for line_number, line in enumerate(lines, 1):
         if not line.strip():
             continue
         try:
@@ -94,12 +155,14 @@ def parse_codex_jsonl(stdout: str) -> dict:
             if not isinstance(event, dict) or not isinstance(event.get("type"), str):
                 raise ValueError("expected a JSON event with a string type")
         except (ValueError, RecursionError) as exc:
-            errors.append(f"line {line_number}: {exc}")
+            if legacy or len(errors) < 20:
+                errors.append(f"line {line_number}: {exc}")
             continue
 
         event_type = event["type"]
         if event_type == "thread.started":
-            thread_ids.append(event.get("thread_id"))
+            thread_events += 1
+            thread_id = event.get("thread_id")
         elif event_type == "item.completed":
             item = event.get("item")
             if isinstance(item, dict) and item.get("type") == "agent_message":
@@ -107,12 +170,12 @@ def parse_codex_jsonl(stdout: str) -> dict:
         elif event_type == "turn.completed":
             completed_turns += 1
             usage = event.get("usage")
-        elif event_type == "turn.failed":
+        elif event_type == "turn.failed" and (legacy or not failure_events):
             failure_events.append(event_type)
 
     return {
-        "thread_id": thread_ids[0] if len(thread_ids) == 1 else None,
-        "thread_event_count": len(thread_ids),
+        "thread_id": thread_id if thread_events == 1 else None,
+        "thread_event_count": thread_events,
         "agent_message": message,
         "completed_turns": completed_turns,
         "usage": usage,

@@ -24,13 +24,25 @@ def _parser():
         if name == "start":
             command.add_argument("--pause-after", choices=framework.PAUSE_STAGES)
             command.add_argument("--output-dir", type=Path)
-    for name in ("pause", "resume", "status"):
+    for name in ("pause", "resume", "status", "revise"):
         command = commands.add_parser(name)
         command.add_argument("--run-dir", type=Path, required=True)
         if name == "resume":
             command.add_argument("--pause-after", choices=framework.PAUSE_STAGES)
+            command.add_argument("--human-note")
+            command.add_argument("--human-reason")
+            command.add_argument("--decision-file", type=Path)
+            command.add_argument("--resolve-pending", choices=("retry", "reverify"))
+            command.add_argument("--budget-reason")
             for limit in framework.RESUME_LIMITS:
                 command.add_argument("--" + limit.replace("_", "-"), type=int)
+        elif name == "revise":
+            command.add_argument("--config", type=Path, required=True)
+            command.add_argument("--reason", required=True)
+            command.add_argument("--human-note")
+            command.add_argument("--pause-after", choices=framework.PAUSE_STAGES)
+        elif name == "status":
+            command.add_argument("--full", action="store_true")
     return parser
 
 
@@ -54,8 +66,10 @@ def main(argv=None, *, runner=None):
         elif command == "resume":
             state = framework.resume(runner=runner, **{key: value for key, value in options.items()
                                                        if value is not None})
+        elif command == "revise":
+            state = framework.revise(runner=runner, **options)
         else:
-            _print(getattr(framework, command)(options["run_dir"]))
+            _print(getattr(framework, command)(**options))
             return 0
     except (OSError, ValueError, RecursionError) as exc:
         print(f"agentbridge: {exc}", file=sys.stderr)

@@ -73,8 +73,8 @@ def required_text(obj: dict, field: str) -> str:
     return value
 
 
-def parse_neon(stdout: str, conversation: str | None) -> tuple[dict, dict]:
-    envelope = parse_agy_json(stdout)
+def parse_neon(stdout: str | dict, conversation: str | None) -> tuple[dict, dict]:
+    envelope = stdout if isinstance(stdout, dict) else parse_agy_json(stdout)
     status = envelope.get("status")
     if not isinstance(status, str):
         raise ValueError("missing Neon status")
@@ -115,18 +115,28 @@ def test_result(result: ProcessResult, min_tests: int, allow_skipped: bool,
     # Unittest writes its report to stderr by default. A trusted custom runner
     # may write the same report to stdout.
     reports = []
-    for stream in (result.stdout, result.stderr):
-        lines = stream.splitlines()
-        for index, line in enumerate(lines):
+    skip_line = False
+    receipts = []
+    for stream in ("stdout", "stderr"):
+        previous = ""
+        awaiting_outcome = None
+        for line in result.lines(stream):
+            if awaiting_outcome is not None and line.strip():
+                if len(reports) < 2:
+                    reports.append((awaiting_outcome, line))
+                awaiting_outcome = None
             match = re.fullmatch(r"Ran (\d{1,9}) tests? in [0-9.]+s", line)
-            if match and index > 0 and lines[index - 1] == "-" * 70:
-                tail = [value for value in lines[index + 1:] if value.strip()]
-                outcome = tail[0] if tail else ""
-                reports.append((int(match[1]), outcome))
+            if match and previous == "-" * 70:
+                awaiting_outcome = int(match[1])
+            previous = line
+            skip_line |= bool(re.search(r" \.\.\. skipped(?:\s|$)", line))
+            if stream == "stdout" and line.startswith("AGENTBRIDGE_TEST_RESULT ") and len(receipts) < 2:
+                receipts.append(line)
+        if awaiting_outcome is not None and len(reports) < 2:
+            reports.append((awaiting_outcome, ""))
     count, outcome = reports[0] if len(reports) == 1 else (0, "")
     skipped_match = re.search(r"\bskipped=(\d{1,9})\b", outcome)
     skipped = int(skipped_match[1]) if skipped_match else 0
-    skip_line = re.search(r" \.\.\. skipped(?:\s|$)", result.stdout + "\n" + result.stderr)
     problem = process_problem(result)
     if result.utf8_ok and len(reports) == 1 and count == 0 and result.exit_code in {0, 5}:
         problem = f"expected one unittest report with at least {min_tests} executed tests"
@@ -139,8 +149,6 @@ def test_result(result: ProcessResult, min_tests: int, allow_skipped: bool,
     if not problem and count - skipped < min_tests:
         problem = f"fewer than {min_tests} tests executed after excluding skips"
     if not problem and proof is not None:
-        receipts = [line for line in result.stdout.splitlines()
-                    if line.startswith("AGENTBRIDGE_TEST_RESULT ")]
         expected = "AGENTBRIDGE_TEST_RESULT " + json.dumps([proof, count, skipped, True])
         if receipts != [expected]:
             problem = "missing or inconsistent independent unittest completion receipt"

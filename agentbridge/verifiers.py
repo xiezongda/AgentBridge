@@ -6,13 +6,16 @@ import re
 import shutil
 import sys
 from dataclasses import asdict, dataclass
+from contextlib import contextmanager
+from hashlib import sha256
 from pathlib import Path
 from secrets import token_hex
 from string import Formatter
 from time import monotonic
 
 from .iteration_evidence import process_problem, required_text, test_result, unittest_command
-from .iteration_files import IntegrityError, checked_path, json_text, manifest, snapshot
+from .iteration_files import IntegrityError, digests, file_sha256, json_text, stream_manifest
+from .process import MAX_PROTOCOL_RECORD_BYTES, ProcessResult, captured_process
 from .protocol import _load_json
 
 PLACEHOLDERS = {"python", "project_dir", "verification_dir", "run_dir", "artifacts_dir"}
@@ -75,7 +78,7 @@ def _test_config(value, spec):
     object_fields(value, {"id", "type", key, "min_tests", "allow_skipped"}, value["type"])
     path = spec.verification_dir / relative_path(required_text(value, key), key)
     kind = "file" if key == "target" and path.is_file() else "directory"
-    checked_path(path, kind)
+    spec.path(path, kind)
     integer(value.setdefault("min_tests", 1), "min_tests", 1)
     if type(value.setdefault("allow_skipped", False)) is not bool:
         raise ValueError("allow_skipped must be a boolean")
@@ -172,11 +175,11 @@ class _Verification:
             raise ValueError(f"invalid verification step: {step}")
         self.spec, self.files, self.runner, self.clock = spec, files, runner, clock
         self.deadline = deadline
-        parent = checked_path(files.directory / "artifacts", "directory", missing_ok=True)
+        parent = spec.path(files.directory / "artifacts", "directory", missing_ok=True)
         if files.directory.parent != spec.output_dir:
             raise IntegrityError("verification run location differs from the configured output")
         parent.mkdir(exist_ok=True)
-        self.artifacts = checked_path(parent / step, "directory", missing_ok=True)
+        self.artifacts = spec.path(parent / step, "directory", missing_ok=True)
         try:
             self.artifacts.mkdir()
         except FileExistsError as exc:
@@ -185,6 +188,7 @@ class _Verification:
         self.metrics = {}
         self.metric_files = {}
 
+    @contextmanager
     def run(self, argv, *, stdin=None, env_extra=None):
         remaining = self.deadline - self.clock()
         if remaining <= 0:
@@ -195,20 +199,19 @@ class _Verification:
                    PYTHONUTF8="1", PYTHONIOENCODING="utf-8", PYTHONSAFEPATH="1",
                    PYTHONNOUSERSITE="1", PYTHONDONTWRITEBYTECODE="1", PYTEST_DISABLE_PLUGIN_AUTOLOAD="1")
         env.update(env_extra or {})
-        result = self.runner(argv, cwd=self.artifacts,
-                             timeout_s=min(self.spec.limits["timeout_s"], remaining),
-                             stdin=stdin, env=env)
-        return result, {"argv": argv, "process": result.audit_metadata(),
-                        "stdout": result.stdout, "stderr": result.stderr}
+        with captured_process(self.runner, argv, cwd=self.artifacts,
+                              timeout_s=min(self.spec.limits["timeout_s"], remaining),
+                              stdin=stdin, env=env) as result:
+            yield result, {"argv": argv, **result.audit(self.spec.file_policy["max_audit_stream_bytes"])}
 
 
 def _unittest(ctx, value):
     proof = token_hex(16)
     cache = ctx.artifacts / f"_cache_{token_hex(16)}"
-    result, audit = ctx.run(unittest_command(ctx.spec.verification_dir / value["tests_dir"],
-                                             ctx.spec.project_dir, cache),
-                            stdin=proof.encode("ascii"))
-    summary = test_result(result, value["min_tests"], value["allow_skipped"], proof)
+    with ctx.run(unittest_command(ctx.spec.verification_dir / value["tests_dir"],
+                                  ctx.spec.project_dir, cache), stdin=proof.encode("ascii")) as (result, audit):
+        summary = test_result(result, value["min_tests"], value["allow_skipped"], proof)
+    summary.pop("process")
     return {**audit, "passed": summary.pop("test_passed"), **summary}
 
 
@@ -226,15 +229,18 @@ def _pytest(ctx, value):
                      ctx.spec.project_dir / (name + ".pyc"), ctx.spec.project_dir / (name + ".pyd")):
             if path.exists():
                 raise IntegrityError(f"project shadows pytest or Python startup: {path}")
-    result, audit = ctx.run(
+    with ctx.run(
         [sys.executable, "-B", "-m", "pytest", "-p", "no:cacheprovider", "-v",
          str(ctx.spec.verification_dir / value["target"])],
         env_extra={"PYTEST_ADDOPTS": "--color=no", "PYTEST_PLUGINS": "",
                    "PYTHONPATH": str(ctx.spec.project_dir),
                    "PYTHONPYCACHEPREFIX": str(ctx.artifacts / f"_cache_{token_hex(16)}")},
-    )
-    lines = result.stdout.strip().splitlines()
-    match = _PYTEST_SUMMARY.fullmatch(lines[-1]) if lines else None
+    ) as (result, audit):
+        last_line = ""
+        for line in result.lines("stdout"):
+            if line.strip():
+                last_line = line.strip()
+    match = _PYTEST_SUMMARY.fullmatch(last_line)
     counts = dict.fromkeys(("passed", "failed", "error", "skipped", "xfailed", "xpassed"), 0)
     seen = set()
     valid = match is not None
@@ -274,17 +280,17 @@ def _command(ctx, value):
             or executable.suffix.casefold() in {".cmd", ".bat"}):
         raise IntegrityError(f"command requires a trusted executable: {executable}")
     argv[0] = str(executable)
-    before = manifest(snapshot(ctx.artifacts))
-    result, audit = ctx.run(argv)
-    after = manifest(snapshot(ctx.artifacts))
-    healthy = result.utf8_ok and not (result.launch_error or result.timed_out)
-    reason = None
-    if not healthy:
-        reason = process_problem(result)
-    elif result.exit_code != value["expected_exit_code"]:
-        reason = f"expected exit {value['expected_exit_code']}, got {result.exit_code}"
-    elif any(term not in result.stdout + "\n" + result.stderr for term in value["must_contain"]):
-        reason = "command output is missing a required substring"
+    before = digests(stream_manifest(ctx.artifacts))
+    with ctx.run(argv) as (result, audit):
+        healthy = result.utf8_ok and not (result.launch_error or result.timed_out)
+        reason = None
+        if not healthy:
+            reason = process_problem(result)
+        elif result.exit_code != value["expected_exit_code"]:
+            reason = f"expected exit {value['expected_exit_code']}, got {result.exit_code}"
+        elif not result.contains(value["must_contain"]):
+            reason = "command output is missing a required substring"
+    after = digests(stream_manifest(ctx.artifacts))
     outputs = {}
     for name in before.keys() | after.keys():
         if before.get(name) != after.get(name):
@@ -336,11 +342,12 @@ def _numeric(ctx, value):
     source = ctx.generated.get(path)
     if source is None:
         raise ValueError("metrics require a file generated by a successful command in this step")
-    payload = checked_path(ctx.artifacts / path, "file").read_bytes()
+    target = ctx.spec.path(ctx.artifacts / path, "file")
+    payload = _json_bytes(target)
     producer, digest = source
     if ctx.metric_files.get(path, digest) != digest:
         raise IntegrityError(f"metrics changed after numerical verification: {path}")
-    if manifest({path: payload})[path] != digest:
+    if sha256(payload).hexdigest() != digest:
         raise IntegrityError(f"metrics changed after command {producer}: {path}")
     data = _load_json(payload.decode("utf-8"))
     if not isinstance(data, dict):
@@ -355,27 +362,37 @@ def _numeric(ctx, value):
 
 def _artifact(ctx, value):
     root = ctx.artifacts if value["scope"] == "artifacts" else ctx.spec.project_dir
-    path = checked_path(root / value["path"], "file", missing_ok=True)
+    path = ctx.spec.path(root / value["path"], "file", missing_ok=True)
     if not path.is_file():
         raise ValueError("required artifact is missing")
-    data = path.read_bytes()
-    if len(data) < value["min_bytes"]:
+    size = path.stat().st_size
+    if size < value["min_bytes"]:
         raise ValueError("artifact is smaller than min_bytes")
     fmt = value["format"]
     if fmt != "file" or value["must_contain"]:
-        text = data.decode("utf-8")
-        if any(term not in text for term in value["must_contain"]):
-            raise ValueError("artifact is missing a required substring")
+        with path.open("rb") as stream:
+            result = ProcessResult(_streams={"stdout": stream})
+            for _ in result.chunks("stdout", errors="strict"):
+                pass
+            if not result.contains(value["must_contain"], channels=("stdout",)):
+                raise ValueError("artifact is missing a required substring")
         if fmt == "json":
-            obj = _load_json(text)
+            obj = _load_json(_json_bytes(path).decode("utf-8"))
             if value["required_keys"] or value["exact_fields"]:
                 if not isinstance(obj, dict) or set(value["required_keys"]) - obj.keys():
                     raise ValueError("artifact JSON lacks required keys")
                 for key, expected in value["exact_fields"].items():
                     if key not in obj or json_text(obj[key]) != json_text(expected):
                         raise ValueError(f"artifact JSON field differs: {key}")
-    return {"passed": True, "bytes": len(data), "path": str(path),
-            "sha256": manifest({path.name: data})[path.name]}
+    return {"passed": True, "bytes": size, "path": str(path), "sha256": file_sha256(path)}
+
+
+def _json_bytes(path):
+    with path.open("rb") as stream:
+        data = stream.read(MAX_PROTOCOL_RECORD_BYTES + 1)
+    if len(data) > MAX_PROTOCOL_RECORD_BYTES:
+        raise ValueError(f"JSON artifact exceeds 16 MiB: {path}")
+    return data
 
 
 # Registration binds definition validation to the corresponding runtime handler.
@@ -426,8 +443,8 @@ def run_verifiers(spec, run_files, step, runner, remaining_budget_s, *, clock=mo
             spec.guard_verification()
         results.append({"id": value["id"], "type": value["type"], **result})
     for path, digest in ctx.metric_files.items():
-        target = checked_path(ctx.artifacts / path, "file")
-        if manifest({path: target.read_bytes()})[path] != digest:
+        target = spec.path(ctx.artifacts / path, "file")
+        if file_sha256(target) != digest:
             raise IntegrityError(f"metrics changed after numerical verification: {path}")
     failures = [result["id"] for result in results if not result["passed"]]
     return VerificationReport(not failures, results, failures, ctx.metrics, str(ctx.artifacts))
