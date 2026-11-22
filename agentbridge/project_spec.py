@@ -15,9 +15,11 @@ from .protocol import _load_json
 from .verifiers import integer, object_fields, string_list, validate_verifiers
 
 ASTRA_MODEL = "gpt-6.2-astra"
+PLANNING_ORDERS = ("neon_first", "astra_first")
 DEFAULT_AGENTS = {
     "coordinator": NEON_MODEL, "executor": SOL_MODEL, "scientist": ASTRA_MODEL,
     "require_astra": False, "sol_effort": "high", "astra_effort": "high",
+    "planning_order": "neon_first",
 }
 DEFAULT_LIMITS = {
     "max_sol_attempts": 3, "max_model_calls": 12, "max_astra_calls": 4,
@@ -190,6 +192,10 @@ class ProjectSpec:
         for field in ("sol_effort", "astra_effort"):
             if not re.fullmatch(r"[a-z][a-z0-9_]*", required_text(agents, field)):
                 raise ValueError(f"{field} must be a lowercase ASCII identifier")
+        if required_text(agents, "planning_order") not in PLANNING_ORDERS:
+            raise ValueError(f"unsupported planning_order: {agents['planning_order']!r}")
+        if agents["planning_order"] == "astra_first" and not agents["require_astra"]:
+            raise ValueError("planning_order 'astra_first' requires require_astra=true")
         return agents
 
     @staticmethod
@@ -233,6 +239,8 @@ class ProjectSpec:
         contract = self.to_dict()
         for key in RESUME_LIMITS:
             del contract["limits"][key]
+        if contract["agents"].get("planning_order") == "neon_first":
+            del contract["agents"]["planning_order"]
         verified = digests(verification_manifest)
         return sha256(json_text({"spec": contract, "verification_manifest": verified})
                       .encode("utf-8")).hexdigest()

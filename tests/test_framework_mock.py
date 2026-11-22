@@ -1093,3 +1093,136 @@ class LennardJonesExampleTests(Fixture):
         self.assertTrue(fixed.all_passed, fixed.results)
         ratio = fixed.metrics_snapshots["physics_thresholds"]["nve"]["coarse_to_fine_ratio"]
         self.assertAlmostEqual(ratio, 4.0, delta=0.05)
+
+
+class AstraFirstPlanningTests(Fixture):
+    def _astra_first_agents(self):
+        return {"require_astra": True, "planning_order": "astra_first"}
+
+    def test_validation_rejects_invalid_or_astra_disabled_planning_order(self):
+        with self.assertRaisesRegex(ValueError, "planning_order"):
+            self.spec(self.config(agents={"require_astra": False, "planning_order": "astra_first"}))
+        with self.assertRaisesRegex(ValueError, "planning_order"):
+            self.spec(self.config(science=True, agents={"require_astra": True, "planning_order": "unknown"}))
+
+    def test_contract_hash_distinguishes_astra_first_and_preserves_default_hash(self):
+        default_spec = self.spec(self.config(science=True))
+        explicit_default = self.spec(self.config(science=True, agents={"require_astra": True, "planning_order": "neon_first"}))
+        astra_first_spec = self.spec(self.config(science=True, agents=self._astra_first_agents()))
+        self.assertEqual(
+            default_spec.contract_hash(default_spec.verification_manifest),
+            explicit_default.contract_hash(explicit_default.verification_manifest),
+        )
+        self.assertNotEqual(
+            default_spec.contract_hash(default_spec.verification_manifest),
+            astra_first_spec.contract_hash(astra_first_spec.verification_manifest),
+        )
+
+    def test_astra_first_happy_path_and_pause_checkpoints(self):
+        mock = MockModels(
+            self,
+            astra_replies=[astra("APPROVE", guidance="Use exact C2 switching."), verdict()],
+            neon_replies=[plan("Follow Astra C2 guidance"), neon()],
+            sol_replies=[self.fix],
+        )
+        state = self.run_models(mock, science=True, agents=self._astra_first_agents(), pause_after="baseline_verify")
+        self.assertEqual(state["current_state"], "PAUSED")
+        self.assertEqual(state["resume_state"], "ASTRA_CONTRACT_REVIEW")
+        self.assertEqual(framework.status(state["run_dir"])["active_role"], "astra")
+        self.assertEqual(mock.roles(), [])
+
+        state = framework.resume(state["run_dir"], pause_after="astra_contract", runner=mock)
+        self.assertEqual(state["current_state"], "PAUSED")
+        self.assertEqual(state["resume_state"], "NEON_PLAN")
+        self.assertIsNone(state["locked_contract_hash"])
+        self.assertEqual(mock.roles(), ["astra"])
+
+        state = framework.resume(state["run_dir"], pause_after="neon_plan", runner=mock)
+        self.assertEqual(state["current_state"], "PAUSED")
+        self.assertEqual(state["resume_state"], "ROUND_SOL_EXEC")
+        self.assertEqual(state["locked_contract_hash"], state["contract_hash"])
+        self.assertEqual(mock.roles(), ["astra", "neon"])
+        self.assertIn("Use exact C2 switching.", mock.prompts("neon")[0])
+
+        final = framework.resume(state["run_dir"], runner=mock)
+        self.assertEqual(final["current_state"], "COMPLETED_PASS", final["stop_reason"])
+        self.assertEqual(mock.roles(), ["astra", "neon", "sol", "neon", "astra"])
+        self.assertIn("Follow Astra C2 guidance", mock.prompts("sol")[0])
+        self.assertIn("Use exact C2 switching.", mock.prompts("sol")[0])
+
+    def test_astra_first_initial_revise_requires_explicit_astra_approval_before_lock(self):
+        mock = MockModels(
+            self,
+            astra_replies=[astra("REVISE", guidance="Tighten numerical guardrails."), astra("APPROVE"), verdict()],
+            neon_replies=[plan("Plan with tightened guardrails"), neon()],
+            sol_replies=[self.fix],
+        )
+        state = self.run_models(mock, science=True, agents=self._astra_first_agents(), pause_after="neon_plan")
+        self.assertEqual(state["current_state"], "PAUSED")
+        self.assertEqual(state["resume_state"], "ASTRA_CONTRACT_REVIEW")
+        self.assertIsNone(state["locked_contract_hash"])
+        self.assertEqual(mock.roles(), ["astra", "neon"])
+
+        final = framework.resume(state["run_dir"], runner=mock)
+        self.assertEqual(final["current_state"], "COMPLETED_PASS", final["stop_reason"])
+        self.assertEqual(final["locked_contract_hash"], final["contract_hash"])
+        self.assertEqual(mock.roles(), ["astra", "neon", "astra", "sol", "neon", "astra"])
+
+    def test_astra_first_neon_escalate_respects_plan_revision_cap_and_resumes(self):
+        mock = MockModels(
+            self,
+            astra_replies=[
+                astra("APPROVE", guidance="Initial framing"),
+                astra("APPROVE", guidance="Clarified framing"),
+                astra("APPROVE", guidance="Final framing"),
+                verdict(),
+            ],
+            neon_replies=[
+                neon("ESCALATE_ASTRA", category="scientific", plan="Need first clarification"),
+                neon("ESCALATE_ASTRA", category="scientific", plan="Need second clarification"),
+                plan("Finalized engineering plan"),
+                neon(),
+            ],
+            sol_replies=[self.fix],
+        )
+        stopped = self.run_models(
+            mock,
+            science=True,
+            agents=self._astra_first_agents(),
+            limits={"max_plan_revisions": 1},
+        )
+        self.assertEqual(stopped["current_state"], "STOPPED_BUDGET_EXCEEDED")
+        self.assertIn("revision limit", stopped["stop_reason"])
+        self.assertIsNone(stopped["locked_contract_hash"])
+        self.assertEqual(mock.roles(), ["astra", "neon", "astra", "neon"])
+
+        final = framework.resume(
+            stopped["run_dir"],
+            runner=mock,
+            max_plan_revisions=2,
+            budget_reason="Allow second Neon-to-Astra scientific clarification.",
+        )
+        self.assertEqual(final["current_state"], "COMPLETED_PASS", final["stop_reason"])
+        self.assertEqual(final["plan_revisions"], 2)
+        self.assertEqual(mock.roles(), ["astra", "neon", "astra", "neon", "astra", "neon", "sol", "neon", "astra"])
+        self.assertIn("Final framing", mock.prompts("neon")[2])
+
+    def test_astra_first_human_stop_resumes_at_astra_then_neon(self):
+        mock = MockModels(
+            self,
+            astra_replies=[astra("NEED_HUMAN"), astra("APPROVE", guidance="Proceed with confirmed scope"), verdict()],
+            neon_replies=[plan("Confirmed plan"), neon()],
+            sol_replies=[self.fix],
+        )
+        stopped = self.run_models(mock, science=True, agents=self._astra_first_agents())
+        self.assertEqual(stopped["current_state"], "STOPPED_NEED_HUMAN")
+        self.assertEqual(stopped["resume_state"], "ASTRA_CONTRACT_REVIEW")
+        final = framework.resume(
+            stopped["run_dir"],
+            runner=mock,
+            human_note="Keep the frozen baseline tolerances.",
+            human_reason="Confirmed by researcher.",
+        )
+        self.assertEqual(final["current_state"], "COMPLETED_PASS", final["stop_reason"])
+        self.assertEqual(mock.roles(), ["astra", "astra", "neon", "sol", "neon", "astra"])
+        self.assertIn("Keep the frozen baseline tolerances.", mock.prompts("astra")[1])

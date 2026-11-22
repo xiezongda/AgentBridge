@@ -6,7 +6,7 @@
 
 1. 从 [外部项目配置模板](examples/external_project_example.json) 复制一份 `project.json`。填写 `goal` 或 `goal_file`，指定项目目录、验收目录、运行目录和可选的只读输入。
 2. 在独立验收目录准备测试或测量脚本。`unittest` 发现 `test_*.py`。还可以使用既有的 `pytest`、显式参数列表 `command`、测量结果 `numeric_metrics` 和 `artifact`。使用 `pytest` 作为项目验收时，当前 Python 需要已经安装它。调度、快照与日志处理使用 Python 3.12 标准库。
-3. 科学任务可设置 `agents.require_astra: true`，填写 `scientific_claims`，让每条主张引用所需的验收器 ID。可参考 [工程示例](examples/mini_ledger/project.json) 和 [Lennard–Jones 示例](examples/lj_physics/project.json)。
+3. 科学任务可设置 `agents.require_astra: true`，填写 `scientific_claims`，让每条主张引用所需的验收器 ID。复杂科研探索任务还可额外设置 `agents.planning_order: "astra_first"`（默认 `"neon_first"`），让 Astra 在只读模式下先审查契约并给出科学设计指导，再由 Neon 编排工程计划并锁定契约。可参考 [工程示例](examples/mini_ledger/project.json) 和 [Lennard–Jones 示例](examples/lj_physics/project.json)。
 
 `allow_external_paths` 默认为 `false`。显式启用后，模板中的绝对路径可直接修改，配置内的相对路径以 `project.json` 所在目录为基准。项目、验收和运行目录互不重叠。只读输入可以是文件或目录，须与项目和运行目录分离。`project_dir` 使用 ASCII 路径并避开 cmd.exe 元字符。路径检查拦截受保护位置、链接、硬链接和 NTFS 重解析点。工作区内的 `--output-dir` 仍可作为启动覆盖项，外部运行目录由配置显式指定。
 

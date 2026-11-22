@@ -331,9 +331,13 @@ class _Framework:
         self.state["verification"] = data
         return data
 
+    def astra_first(self):
+        return self.spec.agents["planning_order"] == "astra_first"
+
     def baseline(self):
         self.state["baseline"] = self.verify_step("baseline_verify")
-        self.complete("baseline_verify", "NEON_PLAN", "baseline_verify")
+        next_state = "ASTRA_CONTRACT_REVIEW" if self.astra_first() else "NEON_PLAN"
+        self.complete("baseline_verify", next_state, "baseline_verify")
 
     def model(self, role, step, prompt, *, validate=None):
         state, spec = self.state, self.spec
@@ -501,8 +505,16 @@ class _Framework:
 
     def plan(self):
         step = self.control_step("neon_plan")
-        prompt = (
+        astra_first = self.astra_first()
+        lead = (
+            "Plan the executor's engineering work without tools, grounded in Astra's scientific review "
+            "and design guidance. Include a plan string unless NEED_HUMAN. "
+            "Use ESCALATE_ASTRA if scientific ambiguities must return to Astra before locking the contract. "
+            if astra_first else
             "Plan the executor's work without tools. Include a plan string unless NEED_HUMAN. "
+        )
+        prompt = (
+            lead
             + self.neon_instruction()
             + (" Astra review is enabled." if self.spec.agents["require_astra"] else " Astra is disabled.")
             + "\n\nProject contract:\n" + _cap(json_text(self.contract_context()), 7500)
@@ -511,11 +523,22 @@ class _Framework:
             + _cap(json_text({"plan": self.state["plan"], "review": self.state["astra_contract_review"]}), 3500)
         )
         self.state["plan"] = self.model("neon", step, prompt, validate=lambda p: _neon_payload(p, plan=True))
-        if self.state["plan"]["decision"] == "NEED_HUMAN":
+        decision = self.state["plan"]["decision"]
+        if decision == "NEED_HUMAN":
             self.checkpoint_step(step)
             self.stop("STOPPED_NEED_HUMAN", self.state["plan"]["reason"])
             return
-        if self.spec.agents["require_astra"]:
+        if astra_first:
+            if decision == "ESCALATE_ASTRA":
+                self.revise_plan(step)
+                self.complete(step, "ASTRA_CONTRACT_REVIEW", "neon_plan")
+            elif (self.state["astra_contract_review"]
+                  and self.state["astra_contract_review"]["decision"] == "APPROVE"):
+                self.lock_contract()
+                self.complete(step, "ROUND_SOL_EXEC", "neon_plan")
+            else:
+                self.complete(step, "ASTRA_CONTRACT_REVIEW", "neon_plan")
+        elif self.spec.agents["require_astra"]:
             self.complete(step, "ASTRA_CONTRACT_REVIEW", "neon_plan")
         else:
             self.lock_contract()
@@ -537,11 +560,23 @@ class _Framework:
 
     def contract_review(self):
         step = self.control_step("astra_contract")
-        prompt = (
+        astra_first = self.astra_first()
+        lead = (
+            "Review the scientific contract and provide scientific design guidance before engineering work "
+            "planning in read-only mode. Assess the question, physical assumptions, units, tolerances, "
+            "controls, and modeling/verification pitfalls. Return JSON with decision APPROVE, REVISE or "
+            "NEED_HUMAN, reason, and actionable scientific guidance for Neon's work plan. "
+            "Use APPROVE when the contract is sound so Neon can draft the work plan from your guidance; "
+            "use REVISE if Neon must draft a plan and return it to you for explicit approval; "
+            "if the locked checks themselves would require changes, use NEED_HUMAN.\n\n"
+            if astra_first and self.state["plan"] is None else
             "Review the scientific contract in read-only mode. Assess the question, physical assumptions, "
             "units, tolerances and controls. Return JSON with decision APPROVE, REVISE or NEED_HUMAN, "
             "reason, and optional guidance. REVISE sends guidance for the work plan. "
             "If the locked checks themselves would require changes, use NEED_HUMAN.\n\n"
+        )
+        prompt = (
+            lead
             + json_text({"contract_hash": self.state["contract_hash"], "contract": self.contract_context(),
                          "plan": self.state["plan"], "baseline": self.state["baseline"]})
         )
@@ -551,8 +586,15 @@ class _Framework:
             self.revise_plan(step)
             self.complete(step, "NEON_PLAN", "astra_contract")
         elif review["decision"] == "APPROVE":
-            self.lock_contract()
-            self.complete(step, "ROUND_SOL_EXEC", "astra_contract")
+            needs_plan = astra_first and (
+                self.state["plan"] is None
+                or self.state["plan"].get("decision") in {"ESCALATE_ASTRA", "NEED_HUMAN"}
+            )
+            if needs_plan:
+                self.complete(step, "NEON_PLAN", "astra_contract")
+            else:
+                self.lock_contract()
+                self.complete(step, "ROUND_SOL_EXEC", "astra_contract")
         else:
             self.checkpoint_step(step)
             self.stop("STOPPED_NEED_HUMAN", review["reason"])
@@ -930,6 +972,8 @@ def _human_target(state):
     if target in {"NEON_PLAN", "ASTRA_CONTRACT_REVIEW"}:
         for key in ("neon_plan", "astra_contract"):
             state["human_cycles"][key] = state["human_cycles"].get(key, 0) + 1
+        if state["config"]["agents"].get("planning_order") == "astra_first":
+            return "ASTRA_CONTRACT_REVIEW"
         return "NEON_PLAN"
     if target == "ROUND_DECIDE":
         state["next_round"] = state["current_round"] + 1
@@ -1087,6 +1131,8 @@ def resume(run_dir, *, pause_after=None, runner=None, clock=monotonic, human_not
             state["plan_revisions"] += 1
             if blocked["stage"] == "ASTRA_CONTRACT_REVIEW":
                 state["resume_state"] = "NEON_PLAN"
+            elif blocked["stage"] == "NEON_PLAN":
+                state["resume_state"] = "ASTRA_CONTRACT_REVIEW"
             else:
                 if blocked["adjustment"]:
                     state["plan"]["plan"] += "\n\nLatest work plan adjustment:\n" + blocked["adjustment"]
