@@ -12,3 +12,12 @@ examples/*_eval/
 
 # Local installer script
 install-agy.ps1
+
+# AgentBridge Workbench runtime database & frontend dependencies
+AgentBridgeWorkbench/workbench.sqlite3*
+AgentBridgeWorkbench/*.sqlite*
+AgentBridgeWorkbench/data/
+AgentBridgeWorkbench/frontend/node_modules/
+AgentBridgeWorkbench/node_modules/
+AgentBridgeWorkbench/.env
+AgentBridgeWorkbench/.env.*

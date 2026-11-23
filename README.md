@@ -2,6 +2,14 @@
 
 日常使用统一从 `run_agentbridge.py` 进入。提供项目配置和独立验收后，程序先跑本地基线，由 Neon 拟定计划，让 Sol 修改项目并记录 diff，再独立验收和复审。启用 Astra 时，程序在锁定契约前审查科学假设、单位和判据，最终逐项核对科学主张的证据。
 
+## 可视化多模型工作台（AgentBridge Workbench）
+
+仓库内 [`AgentBridgeWorkbench/`](./AgentBridgeWorkbench/) 目录提供了独立运行的**可视化多模型工作流编排与对话工作台**（Blender 节点风格 React Flow 画布 + 全局模型卡 + 三级交互式调度控制 + 项目工作区与插件/MCP 配置 + 脱敏模板导出/导入 + `run_flow.py` CLI 与 Antigravity/Codex Skill 桥接）。
+
+* Windows 一键启动：双击 [`AgentBridgeWorkbench/启动工作台.bat`](./AgentBridgeWorkbench/启动工作台.bat)（无需安装 Node.js 或第三方 Python 包，仅需 Python 3.12+）
+* 详细中文使用手册：[`AgentBridgeWorkbench/USER_GUIDE.md`](./AgentBridgeWorkbench/USER_GUIDE.md)
+* 工作台说明：[`AgentBridgeWorkbench/README.md`](./AgentBridgeWorkbench/README.md)
+
 ## 准备项目
 
 1. 从 [外部项目配置模板](examples/external_project_example.json) 复制一份 `project.json`。填写 `goal` 或 `goal_file`，指定项目目录、验收目录、运行目录和可选的只读输入。
